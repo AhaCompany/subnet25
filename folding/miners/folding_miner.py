@@ -130,10 +130,19 @@ class FoldingMiner(BaseMinerNeuron):
         )
 
         # Use ProcessPoolExecutor for better isolation and resource management
-        self.executor = concurrent.futures.ProcessPoolExecutor(
-            max_workers=self.max_workers,
-            mp_context=concurrent.futures.process.get_context('spawn')  # For better stability
-        )
+        try:
+            # Try using spawn context if available (Python 3.8+)
+            import multiprocessing as mp
+            ctx = mp.get_context('spawn')
+            self.executor = concurrent.futures.ProcessPoolExecutor(
+                max_workers=self.max_workers,
+                mp_context=ctx
+            )
+        except (ImportError, TypeError):
+            # Fallback for older Python versions
+            self.executor = concurrent.futures.ProcessPoolExecutor(
+                max_workers=self.max_workers
+            )
 
         # Initialize simulation tracking
         self.mock = None
