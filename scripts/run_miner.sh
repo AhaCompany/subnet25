@@ -4,8 +4,8 @@
 python3 ./neurons/miner.py \
     --netuid 25 \
     --subtensor.network finney \
-    --wallet.name <your_coldkey> \
-    --wallet.hotkey <your_hotkey> \
-    --neuron.max_workers <number of processes to run on your machine> \
-    --axon.port <your_port>
+    --wallet.name c5 \
+    --wallet.hotkey h1 \
+    --neuron.max_workers 2 \
+    --axon.port 24030
 
