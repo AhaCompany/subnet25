@@ -6,6 +6,6 @@ python3 ./neurons/miner.py \
     --subtensor.network finney \
     --wallet.name c5 \
     --wallet.hotkey h1 \
-    --neuron.max_workers 3 \
-    --axon.port 24030
+    --neuron.max_workers 6 \
+    --axon.port 9011
 
