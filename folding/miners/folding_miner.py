@@ -257,35 +257,85 @@ class FoldingMiner(BaseMinerNeuron):
             return False
         return True
 
-    def response_to_dict(self, response) -> dict[str, Any]:
-        response = response.json()["results"][0]
-
-        if "error" in response.keys():
-            raise ValueError(f"Failed to get all PDBs: {response['error']}")
-        elif "values" not in response.keys():
-            return {}
-
-        columns = response["columns"]
-        values = response["values"]
-        data = [dict(zip(columns, row)) for row in values]
-        return data
+    def response_to_dict(self, response) -> List[Dict[str, Any]]:
+        """
+        Convert a rqlite response to a list of dictionaries.
+        
+        This function properly handles error conditions and edge cases in responses.
+        
+        Args:
+            response: The rqlite HTTP response object
+            
+        Returns:
+            List[Dict[str, Any]]: A list of dictionaries containing the query results,
+                                 or an empty list if no results or error
+        """
+        try:
+            response_json = response.json()
+            
+            if not response_json or "results" not in response_json:
+                logger.warning("Invalid response format: missing 'results' key")
+                return []
+                
+            if not response_json["results"] or len(response_json["results"]) == 0:
+                logger.warning("Empty results in response")
+                return []
+                
+            result = response_json["results"][0]
+            
+            if "error" in result:
+                logger.error(f"Database error: {result['error']}")
+                return []
+                
+            if "values" not in result or "columns" not in result:
+                logger.warning("Response missing 'values' or 'columns' keys")
+                return []
+                
+            columns = result["columns"]
+            values = result["values"]
+            
+            if not values:
+                logger.info("No data rows returned")
+                return []
+                
+            # Convert response to list of dictionaries
+            data = []
+            for row in values:
+                if len(row) == len(columns):  # Make sure row and columns match
+                    data.append(dict(zip(columns, row)))
+                else:
+                    logger.warning(f"Row length mismatch: {len(row)} values for {len(columns)} columns")
+                    
+            return data
+            
+        except (KeyError, ValueError, TypeError) as e:
+            logger.error(f"Error parsing database response: {str(e)}")
+            return []
+        except Exception as e:
+            logger.error(f"Unexpected error in response processing: {str(e)}")
+            return []
 
     def fetch_sql_job_details(
         self, columns: List[str], job_id: str, local_db_address: str
-    ) -> Dict:
+    ) -> List[Dict]:
         """
         Fetches job records from a SQLite database with given column details and a specific job_id.
 
         Parameters:
             columns (list): List of column names to retrieve from the database.
             job_id (str): The identifier for the job to fetch.
-            db_path (str): Path to the SQLite database file.
+            local_db_address (str): Address of the rqlite database.
 
         Returns:
-            dict: A dictionary mapping job_id to its details as specified by the columns list.
+            List[Dict]: A list of dictionaries with job details as specified by the columns list.
+                        Returns an empty list if the fetch fails.
         """
 
         logger.info("Fetching job details from the sqlite database")
+
+        if not local_db_address:
+            logger.error("No database address provided")
+            return []
 
         full_local_db_address = f"http://{local_db_address}/db/query"
         columns_to_select = ", ".join(columns)
@@ -295,18 +345,24 @@ class FoldingMiner(BaseMinerNeuron):
             response = requests.get(
                 full_local_db_address,
                 params={"q": query, "level": "strong"},
-                timeout=10,
+                timeout=3,  # Reduce timeout to fail faster
             )
             response.raise_for_status()
 
-            data: dict = self.response_to_dict(response=response)
-            logger.info(f"data response: {data}")
-
+            data: List[Dict] = self.response_to_dict(response=response)
+            if not data:
+                logger.warning(f"No data found for job {job_id}")
+                return []
+                
+            logger.info(f"Data found for job {job_id}")
             return data
 
         except requests.RequestException as e:
-            logger.error(f"Failed to fetch job details {e}")
-            return
+            logger.error(f"Failed to fetch job details: {e}")
+            return []
+        except Exception as e:
+            logger.error(f"Unexpected error fetching job details: {e}")
+            return []
 
     def download_gjp_input_files(
         self,
@@ -392,51 +448,99 @@ class FoldingMiner(BaseMinerNeuron):
                 - Event dictionary with job details (dict)
         """
 
-        columns = ["pdb_id", "system_config"]
-
-        # query your LOCAL rqlite db to get pdb_id
-        sql_job_details = self.fetch_sql_job_details(
-            columns=columns, job_id=job_id, local_db_address=self.local_db_address
-        )[0]
-
-        if len(sql_job_details) == 0:
-            logger.warning(f"Job ID {job_id} not found in the database.")
-            return False, "job_not_found", {}
-
-        # str
-        pdb_id = sql_job_details["pdb_id"]
-
-        # If we are already running a process with the same identifier, return intermediate information
-        logger.info(f"⌛ Checking for protein: {pdb_id} ⌛")
-
+        # First check active simulations - this doesn't require database access
         event = self.create_default_dict()
-        event["pdb_id"] = pdb_id
+        
+        # Check if job_id matches any running simulation
+        for pdb_hash, simulation_data in self.simulations.items():
+            if simulation_data.get("job_id") == job_id:
+                pdb_id = simulation_data.get("pdb_id")
+                if pdb_id:
+                    event["pdb_id"] = pdb_id
+                    event["pdb_hash"] = pdb_hash
+                    event["output_dir"] = simulation_data.get("output_dir")
+                    return True, "running_simulation", event
+                    
+        # If we have job history, check that too (memory cache)
+        if hasattr(self, "job_history") and job_id in self.job_history:
+            job_info = self.job_history[job_id]
+            pdb_id = job_info.get("pdb_id")
+            if pdb_id:
+                # Try to reconstruct hash from available information
+                pdb_hash = None
+                for dir_hash in os.listdir(os.path.join(self.base_data_path, pdb_id)):
+                    if os.path.isdir(os.path.join(self.base_data_path, pdb_id, dir_hash)):
+                        pdb_hash = dir_hash
+                        break
+                
+                if pdb_hash:
+                    event["pdb_id"] = pdb_id
+                    event["pdb_hash"] = pdb_hash
+                    output_dir = os.path.join(self.base_data_path, pdb_id, pdb_hash)
+                    event["output_dir"] = output_dir
+                    gjp_config_filepath = os.path.join(output_dir, f"config_{pdb_id}.pkl")
+                    event["gjp_config_filepath"] = gjp_config_filepath
+                    
+                    # Check if files exist on disk
+                    if os.path.exists(output_dir):
+                        return True, "found_existing_data", event
+        
+        # Only try database if we have a valid connection
+        if self.local_db_address:
+            try:
+                columns = ["pdb_id", "system_config"]
+                # query your LOCAL rqlite db to get pdb_id
+                sql_result = self.fetch_sql_job_details(
+                    columns=columns, job_id=job_id, local_db_address=self.local_db_address
+                )
+                
+                # Safety check for database results
+                if sql_result and isinstance(sql_result, list) and len(sql_result) > 0:
+                    sql_job_details = sql_result[0]
+                    
+                    if sql_job_details and len(sql_job_details) > 0:
+                        # str
+                        pdb_id = sql_job_details.get("pdb_id")
+                        system_config = sql_job_details.get("system_config")
+                        
+                        if pdb_id and system_config:
+                            # If we are already running a process with the same identifier, return intermediate information
+                            logger.info(f"⌛ Checking for protein: {pdb_id} ⌛")
+                            
+                            event["pdb_id"] = pdb_id
+                            try:
+                                gjp_config = json.loads(system_config)
+                                event["gjp_config"] = gjp_config
+                                
+                                pdb_hash = self.get_simulation_hash(pdb_id=pdb_id, system_config=gjp_config)
+                                event["pdb_hash"] = pdb_hash
+                                
+                                if pdb_hash in self.simulations:
+                                    return True, "running_simulation", event
+                                    
+                                # If you don't have in the list of simulations, check your local storage for the data.
+                                output_dir = os.path.join(self.base_data_path, pdb_id, pdb_hash)
+                                gjp_config_filepath = os.path.join(output_dir, f"config_{pdb_id}.pkl")
+                                event["output_dir"] = output_dir
+                                event["gjp_config_filepath"] = gjp_config_filepath
+                                
+                                # check if any of the simulations have finished
+                                event = self.check_and_remove_simulations(event=event)
+                                
+                                submitted_job_is_unique = self.is_unique_job(
+                                    system_config_filepath=gjp_config_filepath
+                                )
+                                
+                                if not submitted_job_is_unique:
+                                    return True, "found_existing_data", event
+                            except Exception as e:
+                                logger.error(f"Error processing job details: {e}")
+            except Exception as e:
+                logger.error(f"Error checking job in database: {e}")
+        else:
+            logger.warning("No database connection available to check job status")
 
-        gjp_config = json.loads(sql_job_details["system_config"])
-        event["gjp_config"] = gjp_config
-
-        pdb_hash = self.get_simulation_hash(pdb_id=pdb_id, system_config=gjp_config)
-        event["pdb_hash"] = pdb_hash
-
-        if pdb_hash in self.simulations:
-            return True, "running_simulation", event
-
-        # If you don't have in the list of simulations, check your local storage for the data.
-        output_dir = os.path.join(self.base_data_path, pdb_id, pdb_hash)
-        gjp_config_filepath = os.path.join(output_dir, f"config_{pdb_id}.pkl")
-        event["output_dir"] = output_dir
-        event["gjp_config_filepath"] = gjp_config_filepath
-
-        # check if any of the simulations have finished
-        event = self.check_and_remove_simulations(event=event)
-
-        submitted_job_is_unique = self.is_unique_job(
-            system_config_filepath=gjp_config_filepath
-        )
-
-        if not submitted_job_is_unique:
-            return True, "found_existing_data", event
-
+        # If we reach here, we haven't worked on this job
         return False, "job_not_worked_on", event
 
     def participation_forward(self, synapse: ParticipationSynapse):
@@ -449,8 +553,19 @@ class FoldingMiner(BaseMinerNeuron):
         """
         job_id = synapse.job_id
         logger.info(f"⌛ Validator checking if miner has participated in job: {job_id} ⌛")
-        has_worked_on_job, _, _ = self.check_if_job_was_worked_on(job_id=job_id)
-        synapse.is_participating = has_worked_on_job
+        
+        try:
+            has_worked_on_job, condition, _ = self.check_if_job_was_worked_on(job_id=job_id)
+            synapse.is_participating = has_worked_on_job
+            if has_worked_on_job:
+                logger.info(f"Miner has worked on job {job_id} (condition: {condition})")
+            else:
+                logger.info(f"Miner has not worked on job {job_id}")
+        except Exception as e:
+            # Even if there's an error, still respond to validator
+            logger.error(f"Error checking job participation: {e}")
+            synapse.is_participating = False
+            
         return synapse
 
     def forward(self, synapse: JobSubmissionSynapse) -> JobSubmissionSynapse:
