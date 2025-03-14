@@ -115,12 +115,32 @@ class FoldingMiner(BaseMinerNeuron):
     def __init__(self, config=None):
         super().__init__(config=config)
 
+        # Setup project path if not already defined
+        if not hasattr(self, 'project_path') or self.project_path is None:
+            self.project_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../"))
+            logger.info(f"Setting project_path to {self.project_path}")
+        
+        # Setup rqlite data directory if not defined
+        if not hasattr(self, 'rqlite_data_dir') or self.rqlite_data_dir is None:
+            self.rqlite_data_dir = "rqlite-data"
+            logger.info(f"Setting rqlite_data_dir to {self.rqlite_data_dir}")
+            
         # Initialize data paths
         self.miner_data_path = os.path.join(self.project_path, "miner-data")
         self.base_data_path = os.path.join(
             self.miner_data_path, self.wallet.hotkey.ss58_address[:8]
         )
+        
+        # Create data directories if they don't exist
+        os.makedirs(self.miner_data_path, exist_ok=True)
+        os.makedirs(self.base_data_path, exist_ok=True)
+        
         self.local_db_address = os.getenv("RQLITE_HTTP_ADDR")
+        if not self.local_db_address:
+            self.local_db_address = "localhost:4001"
+            os.environ["RQLITE_HTTP_ADDR"] = self.local_db_address
+            logger.warning(f"RQLITE_HTTP_ADDR not set, using default: {self.local_db_address}")
+            
         self.simulations = self.create_default_dict()
 
         # Configure worker pool - set optimal based on GPU memory
@@ -152,9 +172,13 @@ class FoldingMiner(BaseMinerNeuron):
         # Generate more diverse seeds for better energy minimization
         self.generate_random_seed = lambda: random.randint(0, 100000)
         
-        # Start local database
-        asyncio.run(self.start_rqlite())
-        time.sleep(5)
+        # Start local database with error handling
+        try:
+            asyncio.run(self.start_rqlite())
+            time.sleep(5)
+        except Exception as e:
+            logger.error(f"Failed to start rqlite: {e}")
+            logger.warning("Continuing without rqlite database - some features may be limited")
 
         # Simulation configuration constants
         self.STATES = ["nvt", "npt", "md_0_1"]
